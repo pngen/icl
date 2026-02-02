@@ -1,0 +1,18 @@
+[package]
+name = "icl"
+version = "1.0.0"
+edition = "2021"
+repository = "github.com/pngen/icl"
+
+[dependencies]
+uuid = { version = "1.0", features = ["v4", "serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1.0"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
+criterion = "0.5"
