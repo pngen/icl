@@ -1,7 +1,7 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use chrono::{DateTime, Utc};
- 
+
 /// Status of an intelligence asset in its lifecycle
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum AssetStatus {
@@ -117,7 +117,7 @@ pub struct CapitalProof {
 
 impl CapitalProof {
     pub fn compute_hash(&self) -> String {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         let content_str = serde_json::to_string(&self.content).unwrap_or_default();
         let hash_input = format!(
