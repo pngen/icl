@@ -16,7 +16,21 @@ pub fn calculate_depreciation(
         });
     }
 
-    if salvage_value < 0.0 {
+    if !asset.initial_value.is_finite() || asset.initial_value <= 0.0 {
+        return Err(IclError::DepreciationError(
+            "Initial value must be positive".into(),
+        ));
+    }
+
+    if let Some(current_value) = asset.current_value {
+        if !current_value.is_finite() || current_value < 0.0 {
+            return Err(IclError::DepreciationError(
+                "Current value cannot be negative".into(),
+            ));
+        }
+    }
+
+    if !salvage_value.is_finite() || salvage_value < 0.0 {
         return Err(IclError::DepreciationError(
             "Salvage value cannot be negative".into(),
         ));
@@ -92,6 +106,12 @@ fn declining_balance_depreciation(
         return Ok((0.0, asset.current_value.unwrap_or(asset.initial_value)));
     }
 
+    if !rate_multiplier.is_finite() || rate_multiplier <= 0.0 {
+        return Err(IclError::DepreciationError(
+            "Rate multiplier must be positive".into(),
+        ));
+    }
+
     let rate = rate_multiplier / asset.useful_life_months as f64;
     let mut current_value = asset.current_value.unwrap_or(asset.initial_value);
 
@@ -145,5 +165,29 @@ mod tests {
         let (dep, new_val) = calculate_depreciation(&asset, start, end, 0.0, 2.0).unwrap();
         assert!((dep - 6000.0).abs() < 0.01);
         assert!((new_val - 6000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_declining_balance_rejects_invalid_rate_multiplier() {
+        let mut asset = test_asset();
+        asset.depreciation_method = DepreciationMethod::DecliningBalance;
+        let start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2024, 2, 1, 0, 0, 0).unwrap();
+
+        assert!(calculate_depreciation(&asset, start, end, 0.0, -1.0).is_err());
+        assert!(calculate_depreciation(&asset, start, end, 0.0, f64::NAN).is_err());
+    }
+
+    #[test]
+    fn test_depreciation_rejects_non_finite_values() {
+        let mut asset = test_asset();
+        let start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2024, 2, 1, 0, 0, 0).unwrap();
+
+        asset.current_value = Some(f64::NAN);
+        assert!(calculate_depreciation(&asset, start, end, 0.0, 2.0).is_err());
+
+        asset.current_value = Some(asset.initial_value);
+        assert!(calculate_depreciation(&asset, start, end, f64::INFINITY, 2.0).is_err());
     }
 }

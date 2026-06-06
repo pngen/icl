@@ -57,7 +57,7 @@ impl IntelligenceCapitalLedger {
             return Err(IclError::InvalidAsset("Owner cannot be empty".into()));
         }
 
-        if initial_value <= 0.0 {
+        if !initial_value.is_finite() || initial_value <= 0.0 {
             return Err(IclError::InvalidAsset(
                 "Initial value must be positive".into(),
             ));
@@ -93,6 +93,31 @@ impl IntelligenceCapitalLedger {
             return Err(IclError::InvalidEvent("Event type cannot be empty".into()));
         }
 
+        if self.events.iter().any(|e| e.event_id == event.event_id) {
+            return Err(IclError::InvalidEvent("Event id already exists".into()));
+        }
+
+        if let Some(last_event) = self.events.last() {
+            if event.timestamp < last_event.timestamp {
+                return Err(IclError::IntegrityViolation(
+                    "Cannot add event with timestamp before last recorded event".into(),
+                ));
+            }
+        }
+
+        let amount = match event.details.get("amount") {
+            Some(value) => {
+                let amount = value
+                    .as_f64()
+                    .ok_or_else(|| IclError::InvalidEvent("Event amount must be numeric".into()))?;
+                if !amount.is_finite() {
+                    return Err(IclError::InvalidEvent("Event amount must be finite".into()));
+                }
+                amount
+            }
+            None => 0.0,
+        };
+
         self.events.push(event.clone());
 
         self._events_by_asset
@@ -105,11 +130,7 @@ impl IntelligenceCapitalLedger {
             event_id: event.event_id,
             asset_id: event.asset_id,
             timestamp: event.timestamp,
-            amount: event
-                .details
-                .get("amount")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0),
+            amount,
             description: event.event_type.clone(),
             metadata: event.details.clone(),
         };
@@ -124,9 +145,19 @@ impl IntelligenceCapitalLedger {
     }
 
     pub fn record_journal_entry(&mut self, journal_entry: JournalEntry) -> IclResult<()> {
-        if journal_entry.amount <= 0.0 {
+        if !journal_entry.amount.is_finite() || journal_entry.amount <= 0.0 {
             return Err(IclError::InvalidEntry(
                 "Journal entry amount must be positive".into(),
+            ));
+        }
+
+        if self
+            .journal_entries
+            .iter()
+            .any(|entry| entry.entry_id == journal_entry.entry_id)
+        {
+            return Err(IclError::InvalidEntry(
+                "Journal entry id already exists".into(),
             ));
         }
 
@@ -145,6 +176,18 @@ impl IntelligenceCapitalLedger {
     ) -> IclResult<CapitalProof> {
         if !self.assets.contains_key(&asset_id) {
             return Err(IclError::AssetNotFound(asset_id));
+        }
+
+        if let Some(event_id) = event_id {
+            let event_belongs_to_asset = self
+                .events
+                .iter()
+                .any(|event| event.event_id == event_id && event.asset_id == asset_id);
+            if !event_belongs_to_asset {
+                return Err(IclError::InvalidEvent(
+                    "Proof event must belong to the requested asset".into(),
+                ));
+            }
         }
 
         let asset_proofs: Vec<&CapitalProof> = self
@@ -248,7 +291,9 @@ impl IntelligenceCapitalLedger {
     }
 
     pub fn verify_journal_balance(&self) -> bool {
-        self.journal_entries.iter().all(|entry| entry.amount > 0.0)
+        self.journal_entries
+            .iter()
+            .all(|entry| entry.amount.is_finite() && entry.amount > 0.0)
     }
 
     pub fn export_audit_trail(&self, format: &str) -> IclResult<String> {
@@ -291,5 +336,150 @@ impl IntelligenceCapitalLedger {
 
     pub fn event_count(&self) -> usize {
         self.events.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn create_asset(ledger: &mut IntelligenceCapitalLedger) -> Uuid {
+        let asset_id = Uuid::new_v4();
+        ledger
+            .create_asset(
+                asset_id,
+                "finance".to_string(),
+                1000.0,
+                DepreciationMethod::Linear,
+                12,
+            )
+            .unwrap();
+        asset_id
+    }
+
+    fn event_at(asset_id: Uuid, event_id: Uuid, timestamp: chrono::DateTime<Utc>) -> CapitalEvent {
+        let mut details = HashMap::new();
+        details.insert("amount".to_string(), serde_json::json!(100.0));
+
+        CapitalEvent {
+            event_id,
+            asset_id,
+            event_type: "utilization".to_string(),
+            timestamp,
+            details,
+        }
+    }
+
+    fn journal_entry(entry_id: Uuid, amount: f64) -> JournalEntry {
+        JournalEntry {
+            entry_id,
+            event_id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            debit_account: AccountType::Asset,
+            credit_account: AccountType::AccumulatedDepreciation,
+            amount,
+            description: "entry".to_string(),
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite_financial_values() {
+        let mut ledger = IntelligenceCapitalLedger::new();
+        assert!(ledger
+            .create_asset(
+                Uuid::new_v4(),
+                "finance".to_string(),
+                f64::NAN,
+                DepreciationMethod::Linear,
+                12,
+            )
+            .is_err());
+        assert!(ledger
+            .create_asset(
+                Uuid::new_v4(),
+                "finance".to_string(),
+                f64::INFINITY,
+                DepreciationMethod::Linear,
+                12,
+            )
+            .is_err());
+
+        assert!(ledger
+            .record_journal_entry(journal_entry(Uuid::new_v4(), f64::NAN))
+            .is_err());
+        assert!(ledger
+            .record_journal_entry(journal_entry(Uuid::new_v4(), f64::INFINITY))
+            .is_err());
+    }
+
+    #[test]
+    fn record_event_rejects_duplicate_and_retroactive_events() {
+        let mut ledger = IntelligenceCapitalLedger::new();
+        let asset_id = create_asset(&mut ledger);
+        let first_time = Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap();
+        let earlier_time = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let event_id = Uuid::new_v4();
+
+        ledger
+            .record_event(event_at(asset_id, event_id, first_time))
+            .unwrap();
+
+        let duplicate = event_at(asset_id, event_id, first_time);
+        assert!(ledger.record_event(duplicate).is_err());
+
+        let retroactive = event_at(asset_id, Uuid::new_v4(), earlier_time);
+        assert!(ledger.record_event(retroactive).is_err());
+        assert_eq!(ledger.event_count(), 1);
+    }
+
+    #[test]
+    fn record_event_rejects_non_numeric_amount() {
+        let mut ledger = IntelligenceCapitalLedger::new();
+        let asset_id = create_asset(&mut ledger);
+        let mut event = event_at(
+            asset_id,
+            Uuid::new_v4(),
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        event
+            .details
+            .insert("amount".to_string(), serde_json::json!("not-a-number"));
+
+        assert!(ledger.record_event(event).is_err());
+        assert_eq!(ledger.event_count(), 0);
+    }
+
+    #[test]
+    fn journal_entry_ids_must_be_unique() {
+        let mut ledger = IntelligenceCapitalLedger::new();
+        let entry_id = Uuid::new_v4();
+        ledger
+            .record_journal_entry(journal_entry(entry_id, 100.0))
+            .unwrap();
+
+        assert!(ledger
+            .record_journal_entry(journal_entry(entry_id, 100.0))
+            .is_err());
+        assert_eq!(ledger.journal_entries.len(), 1);
+    }
+
+    #[test]
+    fn generate_proof_rejects_event_from_another_asset() {
+        let mut ledger = IntelligenceCapitalLedger::new();
+        let first_asset = create_asset(&mut ledger);
+        let second_asset = create_asset(&mut ledger);
+        let event_id = Uuid::new_v4();
+
+        ledger
+            .record_event(event_at(
+                second_asset,
+                event_id,
+                Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            ))
+            .unwrap();
+
+        assert!(ledger.generate_proof(first_asset, Some(event_id)).is_err());
     }
 }
