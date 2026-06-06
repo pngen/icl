@@ -118,17 +118,104 @@ pub struct CapitalProof {
 impl CapitalProof {
     pub fn compute_hash(&self) -> String {
         use sha2::{Digest, Sha256};
+        use std::collections::BTreeMap;
+
+        fn canonicalize_value(value: &serde_json::Value) -> serde_json::Value {
+            match value {
+                serde_json::Value::Array(values) => {
+                    serde_json::Value::Array(values.iter().map(canonicalize_value).collect())
+                }
+                serde_json::Value::Object(values) => {
+                    let mut sorted = serde_json::Map::new();
+                    let mut keys: Vec<&String> = values.keys().collect();
+                    keys.sort();
+                    for key in keys {
+                        if let Some(value) = values.get(key) {
+                            sorted.insert(key.clone(), canonicalize_value(value));
+                        }
+                    }
+                    serde_json::Value::Object(sorted)
+                }
+                _ => value.clone(),
+            }
+        }
+
         let mut hasher = Sha256::new();
-        let content_str = serde_json::to_string(&self.content).unwrap_or_default();
+        let mut sorted_content: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        for (key, value) in &self.content {
+            sorted_content.insert(key.clone(), canonicalize_value(value));
+        }
+        let content_str = serde_json::to_string(&sorted_content).unwrap_or_default();
+        let event_id = self.event_id.map(|id| id.to_string()).unwrap_or_default();
         let hash_input = format!(
-            "{}{}{}{}",
+            "proof_id={}\nasset_id={}\nevent_id={}\ntimestamp={}\norigin={}\ncontent={}\nprevious={}",
             self.proof_id,
-            self.timestamp.timestamp(),
+            self.asset_id,
+            event_id,
+            self.timestamp.to_rfc3339(),
+            self.origin,
             content_str,
-            self.previous_proof_hash.as_ref().unwrap_or(&String::new())
+            self.previous_proof_hash.as_deref().unwrap_or("")
         );
         hasher.update(hash_input.as_bytes());
         let result = hasher.finalize();
         format!("{:x}", result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn proof_with_content(content: HashMap<String, serde_json::Value>) -> CapitalProof {
+        CapitalProof {
+            proof_id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            asset_id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap(),
+            event_id: Some(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap()),
+            timestamp: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            origin: "ICL".to_string(),
+            content,
+            previous_proof_hash: Some("previous".to_string()),
+            proof_hash: None,
+        }
+    }
+
+    #[test]
+    fn proof_hash_is_deterministic_for_content_order() {
+        let mut first_content = HashMap::new();
+        first_content.insert("owner".to_string(), serde_json::json!("finance"));
+        first_content.insert("value".to_string(), serde_json::json!(100.0));
+
+        let mut second_content = HashMap::new();
+        second_content.insert("value".to_string(), serde_json::json!(100.0));
+        second_content.insert("owner".to_string(), serde_json::json!("finance"));
+
+        assert_eq!(
+            proof_with_content(first_content).compute_hash(),
+            proof_with_content(second_content).compute_hash()
+        );
+    }
+
+    #[test]
+    fn proof_hash_binds_audit_envelope_fields() {
+        let mut content = HashMap::new();
+        content.insert("owner".to_string(), serde_json::json!("finance"));
+
+        let proof = proof_with_content(content);
+        let original_hash = proof.compute_hash();
+
+        let mut changed_asset = proof.clone();
+        changed_asset.asset_id =
+            uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap();
+        assert_ne!(original_hash, changed_asset.compute_hash());
+
+        let mut changed_event = proof.clone();
+        changed_event.event_id = None;
+        assert_ne!(original_hash, changed_event.compute_hash());
+
+        let mut changed_origin = proof.clone();
+        changed_origin.origin = "other".to_string();
+        assert_ne!(original_hash, changed_origin.compute_hash());
     }
 }

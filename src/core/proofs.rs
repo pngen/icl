@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::core::error::*;
@@ -81,6 +81,17 @@ impl<'a> CapitalProofGenerator<'a> {
         asset_id: Uuid,
         event_id: Uuid,
     ) -> IclResult<CapitalProof> {
+        let event_belongs_to_asset = self
+            .ledger
+            .events
+            .iter()
+            .any(|event| event.event_id == event_id && event.asset_id == asset_id);
+        if !event_belongs_to_asset {
+            return Err(IclError::InvalidEvent(
+                "Proof event must belong to the requested asset".into(),
+            ));
+        }
+
         let mut proof = self.generate_asset_proof(asset_id)?;
         proof.event_id = Some(event_id);
         proof
@@ -96,6 +107,25 @@ impl<'a> CapitalProofGenerator<'a> {
         start_date: &str,
         end_date: &str,
     ) -> IclResult<CapitalProof> {
+        let period_start = DateTime::parse_from_rfc3339(start_date)
+            .map_err(|_| IclError::InvalidDateRange {
+                start: start_date.to_string(),
+                end: end_date.to_string(),
+            })?
+            .with_timezone(&Utc);
+        let period_end = DateTime::parse_from_rfc3339(end_date)
+            .map_err(|_| IclError::InvalidDateRange {
+                start: start_date.to_string(),
+                end: end_date.to_string(),
+            })?
+            .with_timezone(&Utc);
+        if period_start >= period_end {
+            return Err(IclError::InvalidDateRange {
+                start: start_date.to_string(),
+                end: end_date.to_string(),
+            });
+        }
+
         let mut proof = self.generate_asset_proof(asset_id)?;
         proof.content.insert(
             "proof_type".to_string(),
@@ -112,6 +142,7 @@ impl<'a> CapitalProofGenerator<'a> {
         let total_depreciation: f64 = events
             .iter()
             .filter(|e| e.event_type == "depreciation")
+            .filter(|e| depreciation_event_overlaps_period(e, period_start, period_end))
             .filter_map(|e| e.details.get("amount").and_then(|v| v.as_f64()))
             .sum();
         proof.content.insert(
@@ -148,5 +179,134 @@ impl<'a> CapitalProofGenerator<'a> {
             return stored_hash == &computed;
         }
         false
+    }
+}
+
+fn depreciation_event_overlaps_period(
+    event: &CapitalEvent,
+    period_start: DateTime<Utc>,
+    period_end: DateTime<Utc>,
+) -> bool {
+    let event_start = event
+        .details
+        .get("start_date")
+        .and_then(|value| value.as_str())
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc));
+    let event_end = event
+        .details
+        .get("end_date")
+        .and_then(|value| value.as_str())
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc));
+
+    match (event_start, event_end) {
+        (Some(start), Some(end)) => start < period_end && end > period_start,
+        _ => event.timestamp >= period_start && event.timestamp < period_end,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::ledger::IntelligenceCapitalLedger;
+    use chrono::TimeZone;
+    use std::collections::HashMap;
+
+    fn create_asset(ledger: &mut IntelligenceCapitalLedger) -> Uuid {
+        let asset_id = Uuid::new_v4();
+        ledger
+            .create_asset(
+                asset_id,
+                "finance".to_string(),
+                1000.0,
+                DepreciationMethod::Linear,
+                12,
+            )
+            .unwrap();
+        asset_id
+    }
+
+    fn depreciation_event(
+        asset_id: Uuid,
+        timestamp: DateTime<Utc>,
+        amount: f64,
+        start_date: &str,
+        end_date: &str,
+    ) -> CapitalEvent {
+        let mut details = HashMap::new();
+        details.insert("amount".to_string(), serde_json::json!(amount));
+        details.insert("start_date".to_string(), serde_json::json!(start_date));
+        details.insert("end_date".to_string(), serde_json::json!(end_date));
+
+        CapitalEvent {
+            event_id: Uuid::new_v4(),
+            asset_id,
+            event_type: "depreciation".to_string(),
+            timestamp,
+            details,
+        }
+    }
+
+    #[test]
+    fn execution_proof_rejects_event_from_another_asset() {
+        let mut ledger = IntelligenceCapitalLedger::new();
+        let first_asset = create_asset(&mut ledger);
+        let second_asset = create_asset(&mut ledger);
+        let event = depreciation_event(
+            second_asset,
+            Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap(),
+            100.0,
+            "2024-01-01T00:00:00Z",
+            "2024-02-01T00:00:00Z",
+        );
+        let event_id = event.event_id;
+        ledger.record_event(event).unwrap();
+
+        let generator = CapitalProofGenerator::new(&ledger);
+        assert!(generator
+            .generate_execution_proof(first_asset, event_id)
+            .is_err());
+    }
+
+    #[test]
+    fn financial_outcome_proof_sums_only_requested_period() {
+        let mut ledger = IntelligenceCapitalLedger::new();
+        let asset_id = create_asset(&mut ledger);
+        ledger
+            .record_event(depreciation_event(
+                asset_id,
+                Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap(),
+                100.0,
+                "2024-01-01T00:00:00Z",
+                "2024-02-01T00:00:00Z",
+            ))
+            .unwrap();
+        ledger
+            .record_event(depreciation_event(
+                asset_id,
+                Utc.with_ymd_and_hms(2024, 3, 2, 0, 0, 0).unwrap(),
+                300.0,
+                "2024-03-01T00:00:00Z",
+                "2024-04-01T00:00:00Z",
+            ))
+            .unwrap();
+
+        let generator = CapitalProofGenerator::new(&ledger);
+        let proof = generator
+            .generate_financial_outcome_proof(
+                asset_id,
+                "2024-01-01T00:00:00Z",
+                "2024-02-01T00:00:00Z",
+            )
+            .unwrap();
+
+        assert_eq!(
+            proof
+                .content
+                .get("total_depreciation")
+                .and_then(|value| value.as_f64()),
+            Some(100.0)
+        );
     }
 }

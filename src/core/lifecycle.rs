@@ -64,6 +64,10 @@ impl<'a> IntelligenceCapitalLifecycle<'a> {
     }
 
     pub fn allocate(&mut self, asset_id: Uuid, target_owner: String) -> IclResult<CapitalEvent> {
+        if target_owner.is_empty() {
+            return Err(IclError::InvalidAsset("Owner cannot be empty".into()));
+        }
+
         let asset = self
             .ledger
             .get_asset(asset_id)
@@ -103,11 +107,16 @@ impl<'a> IntelligenceCapitalLifecycle<'a> {
     }
 
     pub fn utilize(&mut self, asset_id: Uuid, amount: f64) -> IclResult<CapitalEvent> {
-        if !self.ledger.assets.contains_key(&asset_id) {
-            return Err(IclError::AssetNotFound(asset_id));
+        let asset = self
+            .ledger
+            .get_asset(asset_id)
+            .ok_or(IclError::AssetNotFound(asset_id))?;
+
+        if asset.status == AssetStatus::Retired {
+            return Err(IclError::AssetRetired(asset_id));
         }
 
-        if amount <= 0.0 {
+        if !amount.is_finite() || amount <= 0.0 {
             return Err(IclError::InvalidEvent(
                 "Utilization amount must be positive".into(),
             ));
@@ -311,5 +320,50 @@ impl<'a> IntelligenceCapitalLifecycle<'a> {
                 .filter_map(|e| e.details.get("amount").and_then(|v| v.as_f64()))
                 .sum::<f64>(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_lifecycle_ledger() -> (IntelligenceCapitalLedger, Uuid) {
+        let mut ledger = IntelligenceCapitalLedger::new();
+        let asset_id = Uuid::new_v4();
+        ledger
+            .create_asset(
+                asset_id,
+                "finance".to_string(),
+                1000.0,
+                DepreciationMethod::Linear,
+                12,
+            )
+            .unwrap();
+        (ledger, asset_id)
+    }
+
+    #[test]
+    fn allocate_rejects_empty_owner_without_mutating_asset() {
+        let (mut ledger, asset_id) = create_lifecycle_ledger();
+        let mut lifecycle = IntelligenceCapitalLifecycle::new(&mut ledger);
+
+        assert!(lifecycle.allocate(asset_id, "".to_string()).is_err());
+        assert_eq!(
+            lifecycle.ledger.get_asset(asset_id).unwrap().owner,
+            "finance"
+        );
+    }
+
+    #[test]
+    fn utilize_rejects_retired_assets_and_non_finite_amounts() {
+        let (mut ledger, asset_id) = create_lifecycle_ledger();
+        let mut lifecycle = IntelligenceCapitalLifecycle::new(&mut ledger);
+
+        assert!(lifecycle.utilize(asset_id, f64::NAN).is_err());
+        lifecycle.retire(asset_id).unwrap();
+        assert!(matches!(
+            lifecycle.utilize(asset_id, 100.0),
+            Err(IclError::AssetRetired(id)) if id == asset_id
+        ));
     }
 }
