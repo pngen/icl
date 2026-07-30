@@ -24,43 +24,13 @@ impl<'a> IntelligenceCapitalLifecycle<'a> {
         depreciation_method: DepreciationMethod,
         useful_life_months: i32,
     ) -> IclResult<IntelligenceAsset> {
-        let asset = self.ledger.create_asset(
+        self.ledger.create_asset(
             asset_id,
             owner,
             initial_value,
             depreciation_method,
             useful_life_months,
-        )?;
-
-        let journal_entry = JournalEntry {
-            entry_id: Uuid::new_v4(),
-            event_id: Uuid::new_v4(),
-            timestamp: Utc::now(),
-            debit_account: AccountType::Asset,
-            credit_account: AccountType::AccumulatedDepreciation,
-            amount: initial_value,
-            description: "Asset capitalization".to_string(),
-            metadata: {
-                let mut map = std::collections::HashMap::new();
-                map.insert(
-                    "asset_id".to_string(),
-                    serde_json::Value::String(asset_id.to_string()),
-                );
-                map.insert(
-                    "owner".to_string(),
-                    serde_json::Value::String(asset.owner.clone()),
-                );
-                map.insert(
-                    "initial_value".to_string(),
-                    serde_json::json!(initial_value),
-                );
-                map
-            },
-        };
-
-        self.ledger.record_journal_entry(journal_entry)?;
-
-        Ok(asset)
+        )
     }
 
     pub fn allocate(&mut self, asset_id: Uuid, target_owner: String) -> IclResult<CapitalEvent> {
@@ -76,12 +46,10 @@ impl<'a> IntelligenceCapitalLifecycle<'a> {
         if asset.status == AssetStatus::Retired {
             return Err(IclError::AssetRetired(asset_id));
         }
-
         let old_owner = asset.owner.clone();
 
-        let mut updated_asset = self.ledger.assets.get(&asset_id).unwrap().clone();
+        let mut updated_asset = asset.clone();
         updated_asset.owner = target_owner.clone();
-        self.ledger.assets.insert(asset_id, updated_asset);
 
         let event = CapitalEvent {
             event_id: Uuid::new_v4(),
@@ -102,7 +70,8 @@ impl<'a> IntelligenceCapitalLifecycle<'a> {
             },
         };
 
-        self.ledger.record_event(event.clone())?;
+        self.ledger
+            .commit_transition(updated_asset, false, event.clone(), vec![])?;
         Ok(event)
     }
 
@@ -115,7 +84,6 @@ impl<'a> IntelligenceCapitalLifecycle<'a> {
         if asset.status == AssetStatus::Retired {
             return Err(IclError::AssetRetired(asset_id));
         }
-
         if !amount.is_finite() || amount <= 0.0 {
             return Err(IclError::InvalidEvent(
                 "Utilization amount must be positive".into(),
@@ -134,7 +102,8 @@ impl<'a> IntelligenceCapitalLifecycle<'a> {
             },
         };
 
-        self.ledger.record_event(event.clone())?;
+        self.ledger
+            .commit_transition(asset.clone(), false, event.clone(), vec![])?;
         Ok(event)
     }
 
@@ -154,6 +123,12 @@ impl<'a> IntelligenceCapitalLifecycle<'a> {
         if asset.status == AssetStatus::Retired {
             return Err(IclError::AssetRetired(asset_id));
         }
+        let recorded_at = Utc::now();
+        if end_date > recorded_at {
+            return Err(IclError::DepreciationError(
+                "Depreciation cannot be recorded before its period ends".into(),
+            ));
+        }
 
         use crate::core::integrity::IntegrityChecker;
         let checker = IntegrityChecker::new(self.ledger);
@@ -163,18 +138,17 @@ impl<'a> IntelligenceCapitalLifecycle<'a> {
         let (depreciation_amount, new_value) =
             calculate_depreciation(asset, start_date, end_date, salvage_value, rate_multiplier)?;
 
-        let mut updated_asset = self.ledger.assets.get(&asset_id).unwrap().clone();
+        let mut updated_asset = asset.clone();
         updated_asset.current_value = Some(new_value);
         if new_value <= salvage_value {
             updated_asset.status = AssetStatus::Depreciated;
         }
-        self.ledger.assets.insert(asset_id, updated_asset);
 
         let event = CapitalEvent {
             event_id: Uuid::new_v4(),
             asset_id,
             event_type: "depreciation".to_string(),
-            timestamp: Utc::now(),
+            timestamp: recorded_at,
             details: {
                 let mut map = std::collections::HashMap::new();
                 map.insert("amount".to_string(), serde_json::json!(depreciation_amount));
@@ -203,13 +177,11 @@ impl<'a> IntelligenceCapitalLifecycle<'a> {
             },
         };
 
-        self.ledger.record_event(event.clone())?;
-
-        if depreciation_amount > 0.0 {
-            let journal_entry = JournalEntry {
+        let journal_entries = if depreciation_amount > 0.0 {
+            vec![JournalEntry {
                 entry_id: Uuid::new_v4(),
                 event_id: event.event_id,
-                timestamp: Utc::now(),
+                timestamp: event.timestamp,
                 debit_account: AccountType::DepreciationExpense,
                 credit_account: AccountType::AccumulatedDepreciation,
                 amount: depreciation_amount,
@@ -230,10 +202,13 @@ impl<'a> IntelligenceCapitalLifecycle<'a> {
                     }
                     map
                 },
-            };
+            }]
+        } else {
+            vec![]
+        };
 
-            self.ledger.record_journal_entry(journal_entry)?;
-        }
+        self.ledger
+            .commit_transition(updated_asset, false, event.clone(), journal_entries)?;
 
         Ok(event)
     }
@@ -248,11 +223,21 @@ impl<'a> IntelligenceCapitalLifecycle<'a> {
             return Err(IclError::AssetRetired(asset_id));
         }
 
-        let remaining_value = asset.current_value;
-        let mut updated_asset = self.ledger.assets.get(&asset_id).unwrap().clone();
+        let remaining_value = asset.current_value.ok_or_else(|| {
+            IclError::InvalidAsset("Asset must have a current value before retirement".into())
+        })?;
+        if !remaining_value.is_finite()
+            || remaining_value < 0.0
+            || remaining_value > asset.initial_value
+        {
+            return Err(IclError::InvalidAsset(
+                "Asset current value is invalid".into(),
+            ));
+        }
+        let accumulated_depreciation = asset.initial_value - remaining_value;
+        let mut updated_asset = asset.clone();
         updated_asset.status = AssetStatus::Retired;
         updated_asset.current_value = Some(0.0);
-        self.ledger.assets.insert(asset_id, updated_asset);
 
         let event = CapitalEvent {
             event_id: Uuid::new_v4(),
@@ -263,46 +248,76 @@ impl<'a> IntelligenceCapitalLifecycle<'a> {
                 let mut map = std::collections::HashMap::new();
                 map.insert(
                     "retired_value".to_string(),
-                    serde_json::json!(remaining_value.unwrap_or(0.0)),
+                    serde_json::json!(remaining_value),
+                );
+                map.insert(
+                    "accumulated_depreciation".to_string(),
+                    serde_json::json!(accumulated_depreciation),
                 );
                 map
             },
         };
 
-        self.ledger.record_event(event.clone())?;
-
-        if let Some(current_value) = remaining_value {
-            if current_value > 0.0 {
-                let journal_entry = JournalEntry {
-                    entry_id: Uuid::new_v4(),
-                    event_id: event.event_id,
-                    timestamp: Utc::now(),
-                    debit_account: AccountType::AccumulatedDepreciation,
-                    credit_account: AccountType::Asset,
-                    amount: current_value,
-                    description: "Asset retirement write-off".to_string(),
-                    metadata: {
-                        let mut map = std::collections::HashMap::new();
-                        map.insert(
-                            "asset_id".to_string(),
-                            serde_json::Value::String(asset_id.to_string()),
-                        );
-                        map.insert(
-                            "retired_value".to_string(),
-                            serde_json::json!(current_value),
-                        );
-                        map
-                    },
-                };
-
-                self.ledger.record_journal_entry(journal_entry)?;
-            }
+        let mut journal_entries = Vec::new();
+        if accumulated_depreciation > 0.0 {
+            journal_entries.push(JournalEntry {
+                entry_id: Uuid::new_v4(),
+                event_id: event.event_id,
+                timestamp: event.timestamp,
+                debit_account: AccountType::AccumulatedDepreciation,
+                credit_account: AccountType::Asset,
+                amount: accumulated_depreciation,
+                description: "Remove accumulated depreciation on retirement".to_string(),
+                metadata: {
+                    let mut map = std::collections::HashMap::new();
+                    map.insert(
+                        "asset_id".to_string(),
+                        serde_json::Value::String(asset_id.to_string()),
+                    );
+                    map.insert(
+                        "accumulated_depreciation".to_string(),
+                        serde_json::json!(accumulated_depreciation),
+                    );
+                    map
+                },
+            });
         }
+        if remaining_value > 0.0 {
+            journal_entries.push(JournalEntry {
+                entry_id: Uuid::new_v4(),
+                event_id: event.event_id,
+                timestamp: event.timestamp,
+                debit_account: AccountType::RetirementLoss,
+                credit_account: AccountType::Asset,
+                amount: remaining_value,
+                description: "Asset retirement write-off".to_string(),
+                metadata: {
+                    let mut map = std::collections::HashMap::new();
+                    map.insert(
+                        "asset_id".to_string(),
+                        serde_json::Value::String(asset_id.to_string()),
+                    );
+                    map.insert(
+                        "retired_value".to_string(),
+                        serde_json::json!(remaining_value),
+                    );
+                    map
+                },
+            });
+        }
+
+        self.ledger
+            .commit_transition(updated_asset, false, event.clone(), journal_entries)?;
 
         Ok(event)
     }
 
     pub fn get_asset_summary(&self, asset_id: Uuid) -> IclResult<serde_json::Value> {
+        if !self.ledger.storage_is_untampered() {
+            return Err(IclError::IntegrityViolation(
+                "Cannot summarize unaudited ledger state".into(),
+            ));
+        }
         let asset = self
             .ledger
             .get_asset(asset_id)
@@ -326,6 +341,7 @@ impl<'a> IntelligenceCapitalLifecycle<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
 
     fn create_lifecycle_ledger() -> (IntelligenceCapitalLedger, Uuid) {
         let mut ledger = IntelligenceCapitalLedger::new();
@@ -365,5 +381,127 @@ mod tests {
             lifecycle.utilize(asset_id, 100.0),
             Err(IclError::AssetRetired(id)) if id == asset_id
         ));
+    }
+
+    fn append_future_event(ledger: &mut IntelligenceCapitalLedger, asset_id: Uuid) {
+        let mut details = std::collections::HashMap::new();
+        details.insert("amount".to_string(), serde_json::json!(1.0));
+        ledger
+            .record_event(CapitalEvent {
+                event_id: Uuid::new_v4(),
+                asset_id,
+                event_type: "utilization".to_string(),
+                timestamp: Utc::now(),
+                details,
+            })
+            .unwrap();
+        let future = Utc::now() + Duration::days(1);
+        ledger.events.last_mut().unwrap().timestamp = future;
+        ledger.entries.last_mut().unwrap().timestamp = future;
+    }
+
+    #[test]
+    fn lifecycle_transitions_are_atomic_when_event_append_is_rejected() {
+        let (mut ledger, asset_id) = create_lifecycle_ledger();
+        append_future_event(&mut ledger, asset_id);
+        let before_asset = ledger.get_asset(asset_id).unwrap().clone();
+        let before_counts = (
+            ledger.events.len(),
+            ledger.entries.len(),
+            ledger.journal_entries.len(),
+        );
+
+        {
+            let mut lifecycle = IntelligenceCapitalLifecycle::new(&mut ledger);
+            assert!(lifecycle
+                .allocate(asset_id, "operations".to_string())
+                .is_err());
+            assert!(lifecycle
+                .depreciate(
+                    asset_id,
+                    Utc::now() - Duration::days(60),
+                    Utc::now() - Duration::days(30),
+                    0.0,
+                    2.0,
+                )
+                .is_err());
+            assert!(lifecycle.retire(asset_id).is_err());
+            assert!(lifecycle
+                .capitalize(
+                    Uuid::new_v4(),
+                    "finance".to_string(),
+                    500.0,
+                    DepreciationMethod::Linear,
+                    12,
+                )
+                .is_err());
+        }
+
+        assert_eq!(ledger.get_asset(asset_id), Some(&before_asset));
+        assert_eq!(
+            (
+                ledger.events.len(),
+                ledger.entries.len(),
+                ledger.journal_entries.len(),
+            ),
+            before_counts
+        );
+        assert_eq!(ledger.asset_count(), 1);
+    }
+
+    #[test]
+    fn complete_lifecycle_has_traceable_reconciled_postings() {
+        let mut ledger = IntelligenceCapitalLedger::new();
+        let asset_id = Uuid::new_v4();
+        ledger
+            .create_asset_at(
+                asset_id,
+                "finance".to_string(),
+                1200.0,
+                DepreciationMethod::Linear,
+                12,
+                Utc::now() - Duration::days(365),
+            )
+            .unwrap();
+        {
+            let mut lifecycle = IntelligenceCapitalLifecycle::new(&mut ledger);
+            lifecycle
+                .allocate(asset_id, "operations".to_string())
+                .unwrap();
+            lifecycle.utilize(asset_id, 25.0).unwrap();
+            lifecycle
+                .depreciate(
+                    asset_id,
+                    Utc::now() - Duration::days(60),
+                    Utc::now() - Duration::days(29),
+                    0.0,
+                    2.0,
+                )
+                .unwrap();
+            lifecycle.retire(asset_id).unwrap();
+        }
+
+        assert_eq!(ledger.get_events_for_asset(asset_id).len(), 5);
+        assert_eq!(ledger.get_entries_for_asset(asset_id).len(), 5);
+        assert_eq!(ledger.get_journal_entries_for_asset(asset_id).len(), 4);
+        assert!(ledger.verify_journal_balance());
+        assert!(crate::core::integrity::IntegrityChecker::new(&ledger)
+            .check_all_integrity()
+            .is_empty());
+        let capitalization = &ledger.journal_entries[0];
+        assert_eq!(capitalization.debit_account, AccountType::Asset);
+        assert_eq!(
+            capitalization.credit_account,
+            AccountType::CapitalizationSource
+        );
+        assert_eq!(capitalization.event_id, ledger.events[0].event_id);
+        let retirement_event_id = ledger.events.last().unwrap().event_id;
+        let retirement_total: f64 = ledger
+            .journal_entries
+            .iter()
+            .filter(|entry| entry.event_id == retirement_event_id)
+            .map(|entry| entry.amount)
+            .sum();
+        assert!((retirement_total - 1200.0).abs() < 1e-9);
     }
 }

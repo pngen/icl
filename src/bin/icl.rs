@@ -1,6 +1,7 @@
 fn main() {
-    println!("{} layer running...", env!("CARGO_PKG_NAME"));
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
-    }
+    eprintln!(
+        "{} is a library crate; no financial service connector is configured",
+        env!("CARGO_PKG_NAME")
+    );
+    std::process::exit(1);
 }

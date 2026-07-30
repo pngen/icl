@@ -49,7 +49,7 @@ Orchestrates the complete asset lifecycle from capitalization to retirement, inc
 Prevents retroactive modifications, detects and fails on invalid data, and ensures no unowned intelligence execution. Failure modes are explicit and do not compromise system integrity.
 
 ### IntegrationAdapter  
-Consumes inference attribution from ICAE and emits to financial reporting systems. Supports cross-system reconciliation without assuming control over execution or finance platforms.
+Consumes and validates inference attribution from ICAE. Outbound delivery and reconciliation fail closed until a real financial-system connector can provide an external acknowledgement; this crate does not simulate successful delivery.
 
 ## Build
 
@@ -63,13 +63,9 @@ cargo build --release
 cargo test
 ```
 
-## Run
+## Library usage
 
-```bash
-./icl # Linux/macOS
-
-.\icl.exe # Windows
-```
+ICL currently provides an in-memory Rust library. The packaged binary exits with an error rather than claiming that a durable service or financial connector is running.
 
 ## Design Principles
 
@@ -81,4 +77,4 @@ cargo test
 
 ## Requirements
 
-- Rust 1.56+
+- A current stable Rust toolchain
