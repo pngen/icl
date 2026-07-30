@@ -40,22 +40,26 @@ impl std::fmt::Display for DepreciationMethod {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum AccountType {
     Asset,
+    CapitalizationSource,
     AccumulatedDepreciation,
     DepreciationExpense,
+    RetirementLoss,
 }
 
 impl std::fmt::Display for AccountType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AccountType::Asset => write!(f, "Asset"),
+            AccountType::CapitalizationSource => write!(f, "CapitalizationSource"),
             AccountType::AccumulatedDepreciation => write!(f, "AccumulatedDepreciation"),
             AccountType::DepreciationExpense => write!(f, "DepreciationExpense"),
+            AccountType::RetirementLoss => write!(f, "RetirementLoss"),
         }
     }
 }
 
 /// A capitalized intelligence asset with ownership and depreciation rules
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IntelligenceAsset {
     pub asset_id: uuid::Uuid,
     pub owner: String,
@@ -68,7 +72,7 @@ pub struct IntelligenceAsset {
 }
 
 /// A discrete economic event affecting intelligence capital
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CapitalEvent {
     pub event_id: uuid::Uuid,
     pub asset_id: uuid::Uuid,
@@ -78,7 +82,7 @@ pub struct CapitalEvent {
 }
 
 /// Immutable ledger entry derived from capital events
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LedgerEntry {
     pub entry_id: uuid::Uuid,
     pub event_id: uuid::Uuid,
@@ -90,7 +94,7 @@ pub struct LedgerEntry {
 }
 
 /// Double-entry accounting journal entry
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JournalEntry {
     pub entry_id: uuid::Uuid,
     pub event_id: uuid::Uuid,
@@ -103,7 +107,7 @@ pub struct JournalEntry {
 }
 
 /// Machine-verifiable proof of capital state for audit purposes
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CapitalProof {
     pub proof_id: uuid::Uuid,
     pub asset_id: uuid::Uuid,
@@ -143,6 +147,9 @@ impl CapitalProof {
         let mut hasher = Sha256::new();
         let mut sorted_content: BTreeMap<String, serde_json::Value> = BTreeMap::new();
         for (key, value) in &self.content {
+            if key == "_ledger_authentication" {
+                continue;
+            }
             sorted_content.insert(key.clone(), canonicalize_value(value));
         }
         let content_str = serde_json::to_string(&sorted_content).unwrap_or_default();
@@ -217,5 +224,20 @@ mod tests {
         let mut changed_origin = proof.clone();
         changed_origin.origin = "other".to_string();
         assert_ne!(original_hash, changed_origin.compute_hash());
+    }
+
+    #[test]
+    fn private_authentication_tag_does_not_change_public_proof_hash() {
+        let mut content = HashMap::new();
+        content.insert("owner".to_string(), serde_json::json!("finance"));
+
+        let mut proof = proof_with_content(content);
+        let public_hash = proof.compute_hash();
+        proof.content.insert(
+            "_ledger_authentication".to_string(),
+            serde_json::json!("private-tag"),
+        );
+
+        assert_eq!(proof.compute_hash(), public_hash);
     }
 }
