@@ -63,9 +63,19 @@ cargo build --release
 cargo test
 ```
 
+## Run
+
+```bash
+cargo build --release
+./target/release/icl # Linux/macOS
+.\target\release\icl.exe # Windows
+```
+
+The packaged binary is the supervised AIGOS layer process: it emits the canonical startup line and remains alive until the supervisor terminates it.
+
 ## Library usage
 
-ICL currently provides an in-memory Rust library. The packaged binary exits with an error rather than claiming that a durable service or financial connector is running.
+ICL provides an in-memory Rust library. Outbound delivery and reconciliation fail closed until a real financial-system connector can provide an external acknowledgement; the layer process does not simulate successful delivery.
 
 ## Design Principles
 
