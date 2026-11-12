@@ -156,8 +156,13 @@ fn linear_depreciation(
     let max_depreciation = depreciable_base * monthly_rate * months;
 
     let current = asset.current_value.unwrap_or(asset.initial_value);
-    let depreciation_amount = max_depreciation.min(current - salvage_value).max(0.0);
-    let new_value = (current - depreciation_amount).max(salvage_value);
+    let scheduled_amount = max_depreciation.min(current - salvage_value).max(0.0);
+    let new_value = (current - scheduled_amount).max(salvage_value);
+    // Report the amount actually removed from the carrying value. Subtracting
+    // the scheduled amount rounds at the carrying value's precision, so for
+    // large assets the scheduled amount no longer equals `current - new_value`
+    // and the ledger would reject the event as unreconciled.
+    let depreciation_amount = current - new_value;
 
     Ok((depreciation_amount, new_value))
 }

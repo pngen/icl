@@ -422,6 +422,21 @@ impl IntelligenceCapitalLedger {
             return Err(IclError::AssetNotFound(asset.asset_id));
         }
 
+        // A stored proof attests the asset's state as of its timestamp. A
+        // transition that changes that state but is dated at or before the proof
+        // would retroactively contradict it and leave the ledger unverifiable.
+        if !is_new_asset
+            && self.assets.get(&asset.asset_id) != Some(&asset)
+            && self
+                .proofs
+                .iter()
+                .any(|proof| proof.asset_id == asset.asset_id && proof.timestamp >= event.timestamp)
+        {
+            return Err(IclError::IntegrityViolation(
+                "Cannot change an asset at or before the timestamp of an existing proof".into(),
+            ));
+        }
+
         let amount = self.validate_event_data(&event, Some(asset.asset_id))?;
         let mut staged_ids = Vec::with_capacity(journal_entries.len());
         for (index, journal_entry) in journal_entries.iter().enumerate() {
@@ -1226,6 +1241,45 @@ mod tests {
             .check_all_integrity()
             .iter()
             .any(|error| error.contains("does not match its source event")));
+    }
+
+    #[test]
+    fn state_change_dated_before_an_existing_proof_is_rejected() {
+        let mut ledger = IntelligenceCapitalLedger::new();
+        let asset_id = create_asset(&mut ledger);
+        // The proof attests that "finance" owns the asset as of now.
+        ledger.generate_proof(asset_id, None).unwrap();
+
+        let backdated_time = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let mut details = HashMap::new();
+        details.insert("from_owner".to_string(), serde_json::json!("finance"));
+        details.insert("to_owner".to_string(), serde_json::json!("operations"));
+        let backdated_allocation = CapitalEvent {
+            event_id: Uuid::new_v4(),
+            asset_id,
+            event_type: "allocation".to_string(),
+            timestamp: backdated_time,
+            details,
+        };
+
+        assert!(matches!(
+            ledger.record_event(backdated_allocation),
+            Err(IclError::IntegrityViolation(_))
+        ));
+        assert_eq!(ledger.get_asset(asset_id).unwrap().owner, "finance");
+        assert!(crate::core::integrity::IntegrityChecker::new(&ledger)
+            .check_all_integrity()
+            .is_empty());
+        ledger.generate_proof(asset_id, None).unwrap();
+        ledger.export_audit_trail("json").unwrap();
+
+        // A late event that leaves the attested state unchanged is still valid.
+        ledger
+            .record_event(event_at(asset_id, Uuid::new_v4(), backdated_time))
+            .unwrap();
+        assert!(crate::core::integrity::IntegrityChecker::new(&ledger)
+            .check_all_integrity()
+            .is_empty());
     }
 
     #[test]

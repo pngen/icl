@@ -450,6 +450,46 @@ mod tests {
     }
 
     #[test]
+    fn depreciation_reconciles_for_large_carrying_values() {
+        use chrono::TimeZone;
+
+        let created_at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let period_end = Utc.with_ymd_and_hms(2024, 2, 1, 0, 0, 0).unwrap();
+        for (initial_value, useful_life_months) in [
+            (100_000_000.0, 36),
+            (123_456_789.0, 7),
+            (987_654_321.0, 60),
+            (5_000_000_000.0, 84),
+        ] {
+            let mut ledger = IntelligenceCapitalLedger::new();
+            let asset_id = Uuid::new_v4();
+            ledger
+                .create_asset_at(
+                    asset_id,
+                    "finance".to_string(),
+                    initial_value,
+                    DepreciationMethod::Linear,
+                    useful_life_months,
+                    created_at,
+                )
+                .unwrap();
+
+            let event = IntelligenceCapitalLifecycle::new(&mut ledger)
+                .depreciate(asset_id, created_at, period_end, 0.0, 2.0)
+                .unwrap_or_else(|error| {
+                    panic!("depreciating {initial_value} over {useful_life_months} months: {error}")
+                });
+            let amount = event.details["amount"].as_f64().unwrap();
+            let expected = initial_value / useful_life_months as f64;
+            assert!((amount - expected).abs() <= expected * 1e-12);
+            assert!(ledger.verify_journal_balance());
+            assert!(crate::core::integrity::IntegrityChecker::new(&ledger)
+                .check_all_integrity()
+                .is_empty());
+        }
+    }
+
+    #[test]
     fn complete_lifecycle_has_traceable_reconciled_postings() {
         let mut ledger = IntelligenceCapitalLedger::new();
         let asset_id = Uuid::new_v4();
